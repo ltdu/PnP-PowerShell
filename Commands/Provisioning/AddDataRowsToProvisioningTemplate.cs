@@ -16,7 +16,7 @@ using System.Threading.Tasks;
 namespace SharePointPnP.PowerShell.Commands.Provisioning
 {
     [Cmdlet("Add", "PnPDataRowsToProvisioningTemplate")]
-    
+
     [CmdletHelp("Adds datarows to a list inside a PnP Provisioning Template",
         Category = CmdletHelpCategory.Provisioning)]
     [CmdletExample(
@@ -44,7 +44,7 @@ namespace SharePointPnP.PowerShell.Commands.Provisioning
         [Parameter(Mandatory = false, Position = 5, HelpMessage = "A switch to include ObjectSecurity information.")]
         public SwitchParameter IncludeSecurity;
 
-        [Parameter(Mandatory = false, Position = 4, HelpMessage = "Allows you to specify ITemplateProviderExtension to execute while loading the template." )]
+        [Parameter(Mandatory = false, Position = 4, HelpMessage = "Allows you to specify ITemplateProviderExtension to execute while loading the template.")]
         public ITemplateProviderExtension[] TemplateProviderExtensions;
 
 
@@ -66,39 +66,56 @@ namespace SharePointPnP.PowerShell.Commands.Provisioning
             {
                 throw new ApplicationException("Invalid template file!");
             }
-            //We will remove a list if it's found so we can get the list
-
-            ListInstance listInstance = template.Lists.Find(l => l.Title == List.Title);
-            if (listInstance == null)
-            {
-                throw new ApplicationException("List does not exist in the template file!");
-            }
 
             List spList = List.GetList(SelectedWeb);
             ClientContext.Load(spList, l => l.RootFolder, l => l.HasUniqueRoleAssignments);
             ClientContext.ExecuteQueryRetry();
 
+            string spListUrl = spList.RootFolder.ServerRelativeUrl.Substring(this.SelectedWeb.ServerRelativeUrl.Length).Trim('/');
+
+            ListInstance listInstance = template.Lists.Find(l => l.Url.Equals(spListUrl, StringComparison.OrdinalIgnoreCase) || l.Title.Equals(spList.Title, StringComparison.OrdinalIgnoreCase));
+            if (listInstance == null)
+            {
+                throw new ApplicationException("List does not exist in the template file!");
+            }
+
+            Microsoft.SharePoint.Client.FieldCollection fieldCollection = spList.Fields;
+            ClientContext.Load(fieldCollection, fs => fs.Include(f => f.InternalName, f => f.FieldTypeKind, f => f.TypeAsString));
+            ClientContext.ExecuteQueryRetry();
+
             CamlQuery query = new CamlQuery();
 
             var viewFieldsStringBuilder = new StringBuilder();
+            List<string> fieldsToRetrieve = new List<string>();
             if (Fields != null)
             {
                 viewFieldsStringBuilder.Append("<ViewFields>");
                 foreach (var field in Fields)
                 {
-                    viewFieldsStringBuilder.AppendFormat("<FieldRef Name='{0}'/>", field);
+                    var fieldInternalName = (from f in fieldCollection where f.InternalName.Equals(field, StringComparison.OrdinalIgnoreCase) select f.InternalName).FirstOrDefault();
+                    if (!string.IsNullOrEmpty(fieldInternalName))
+                    {
+                        fieldsToRetrieve.Add(fieldInternalName);
+                        viewFieldsStringBuilder.AppendFormat("<FieldRef Name='{0}'/>", fieldInternalName);
+                    }
+                    else
+                    {
+                        // PRINT WARNING HERE ABOUT MISSING FIELD
+                    }
                 }
+
                 viewFieldsStringBuilder.Append("</ViewFields>");
+            }
+            else
+            {
+                var fieldInternalNames = from f in fieldCollection select f.InternalName;
+                fieldsToRetrieve.AddRange(fieldInternalNames.AsEnumerable());
             }
 
             query.ViewXml = string.Format("<View>{0}{1}</View>", Query, viewFieldsStringBuilder);
             var listItems = spList.GetItems(query);
 
             ClientContext.Load(listItems, lI => lI.Include(l => l.HasUniqueRoleAssignments, l => l.ContentType.StringId));
-            ClientContext.ExecuteQueryRetry();
-
-            Microsoft.SharePoint.Client.FieldCollection fieldCollection = spList.Fields;
-            ClientContext.Load(fieldCollection, fs => fs.Include(f => f.InternalName, f => f.FieldTypeKind));
             ClientContext.ExecuteQueryRetry();
 
             var rows = new DataRowCollection(template);
@@ -135,33 +152,29 @@ namespace SharePointPnP.PowerShell.Commands.Provisioning
                                 }
                             }
                         }
-                        if (Fields != null)
+
+                        foreach (var fieldInternalName in fieldsToRetrieve)
                         {
-                            foreach (var field in Fields)
+                            Microsoft.SharePoint.Client.Field dataField = fieldCollection.GetFieldByInternalName(fieldInternalName);
+
+                            if (dataField != null)
                             {
-                                Microsoft.SharePoint.Client.Field dataField = fieldCollection.FirstOrDefault(f => f.InternalName == field);
-
-                                if (dataField != null)
+                                string fieldValue = null;
+                                switch (dataField.TypeAsString)
                                 {
-                                    var defaultFieldValue = listItem[field] as string;
-                                    row.Values.Add(field, defaultFieldValue);
-
+                                    case "Lookup":
+                                        {
+                                            var lookupValue = listItem[fieldInternalName] as FieldLookupValue;
+                                            if (lookupValue != null)
+                                                fieldValue = Convert.ToString(lookupValue.LookupId);
+                                            break;
+                                        }
+                                    default:
+                                        fieldValue = Convert.ToString(listItem[fieldInternalName]);                                       
+                                        break;
                                 }
 
-
-                            }
-                        }
-                        else
-                        {
-                            //All fields are added
-                            foreach (var field in fieldCollection)
-                            {
-                                var fldKey = (from f in listItem.FieldValues.Keys where f == field.InternalName select f).FirstOrDefault();
-                                if (!string.IsNullOrEmpty(fldKey))
-                                {
-                                    var fieldValue = listItem[field.InternalName] as string;
-                                    row.Values.Add(field.InternalName, fieldValue);
-                                }
+                                row.Values.Add(fieldInternalName, fieldValue);
                             }
                         }
 
